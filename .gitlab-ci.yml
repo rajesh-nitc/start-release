@@ -1,0 +1,132 @@
+image: maven:latest
+
+stages:
+  - start-release
+  - publish-release
+  - deploy-release
+  - end-release
+
+variables:
+  MAVEN_GET_VERSION: "org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate -Dexpression=project.version -q -DforceStdout"
+  MAVEN_SET_VERSION: "versions:set -DgenerateBackupPoms=false -DnewVersion"
+  MAVEN_CLI_OPTS: "-s .m2/settings.xml --batch-mode"
+
+before_script:
+  - git config --global user.email "rajesh.nitc@gmail.com"
+  - git config --global user.name "Rajesh Gupta"
+
+start-release:
+  stage: start-release
+  script:
+    - |
+      #!/bin/bash
+      set -eo pipefail
+      git clone https://oauth2:"${GIT_TOKEN}"@gitlab.com/"${GIT_USER}"/"${CI_PROJECT_NAME}".git
+      cd "${CI_PROJECT_NAME}"
+
+      # Get pom versions from develop
+      git checkout develop
+      pom_version=$(mvn $MAVEN_GET_VERSION)
+      pom_version_without_snapshot=$(echo $pom_version | cut -d "-" -f1)
+      echo "pom version in dev is ${pom_version}"
+      
+      # Create release branch and push to remote
+      if [[ -z $RELEASE_VERSION ]]; then
+        RELEASE_VERSION=${pom_version_without_snapshot}
+      fi
+      git checkout -b release/$RELEASE_VERSION
+      mvn $MAVEN_SET_VERSION=$pom_version_without_snapshot
+      git add .
+      git commit -m "first commit in release/$RELEASE_VERSION"
+      git push origin release/$RELEASE_VERSION
+
+      # Increment patch version in develop if RELEASE_VERSION is not provided by user
+      git checkout develop
+      if [[ -z $RELEASE_VERSION ]]; then
+        mvn build-helper:parse-version versions:set -DnewVersion=\${parsedVersion.majorVersion}.\${parsedVersion.minorVersion}.\${parsedVersion.nextIncrementalVersion}-\${parsedVersion.qualifier} versions:commit
+      else
+        mvn $MAVEN_SET_VERSION=$RELEASE_VERSION
+      fi
+      git add .
+      git commit -m "[skip ci]"
+      git push origin develop
+  only: 
+    variables:
+      - $CMD == "start-release"
+
+publish-release:
+  stage: publish-release
+  script:
+    - |
+      #!/bin/bash
+      set -eo pipefail
+      mvn clean package
+      # mvn $MAVEN_CLI_OPTS deploy
+  only: 
+    refs:
+      - /^release.*/
+
+deploy-release:
+  stage: deploy-release
+  script:
+    - |
+      #!/bin/bash
+      set -eo pipefail
+      RELEASE_VERSION=$(mvn $MAVEN_GET_VERSION)
+      echo "RELEASE_VERSION is $RELEASE_VERSION"
+      echo "calling ansible playbook with right environment variables..."
+  only: 
+    refs:
+      - /^release.*/
+
+end-release:
+  stage: end-release
+  script:
+    - |
+      #!/bin/bash
+      git clone https://oauth2:"${GIT_TOKEN}"@gitlab.com/"${GIT_USER}"/"${CI_PROJECT_NAME}".git
+      cd "${CI_PROJECT_NAME}"
+      
+      # Setting release branch pom version equal to dev so that merge can happen 
+      git checkout develop
+      pom_version_dev=$(mvn $MAVEN_GET_VERSION)
+      echo "pom version in develop is $pom_version_dev"
+      git checkout release/$RELEASE_VERSION
+      pom_version_rel=$(mvn $MAVEN_GET_VERSION)
+      echo "pom version in release is $pom_version_rel"
+      mvn $MAVEN_SET_VERSION=$pom_version_dev
+      git add .
+      git commit -m "[skip ci]"
+      git push origin release/$RELEASE_VERSION
+      git checkout develop
+      git merge release/$RELEASE_VERSION
+      git push
+      
+      # Skip push to master in case it's pom version is equal to release version 
+      git checkout master
+      pom_version_master=$(mvn $MAVEN_GET_VERSION)
+      if [[ "${pom_version_master}" != "${RELEASE_VERSION}" ]]; then
+        mvn $MAVEN_SET_VERSION=$RELEASE_VERSION
+        git add .
+        git commit -m "[skip ci]"
+        git push
+      fi
+      
+      # Correcting back the release pom version
+      git checkout release/$RELEASE_VERSION
+      mvn $MAVEN_SET_VERSION=$RELEASE_VERSION
+      git add .
+      git commit -m "[skip ci]"
+      git push
+      
+      # Back merge release in master
+      git checkout master
+      git merge release/$RELEASE_VERSION
+      git tag -a ${RELEASE_VERSION} -m "Create release version"
+      git push --follow-tags
+      
+      # Delete release
+      git push origin --delete release/$RELEASE_VERSION
+  only: 
+    variables:
+      - $CMD == "end-release" && $RELEASE_VERSION =~ /^\d+\.\d+\.\d+$/
